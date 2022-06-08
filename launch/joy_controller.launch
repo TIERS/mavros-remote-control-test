@@ -1,0 +1,7 @@
+<launch>
+
+    <node name="mavros_joy_global_offboard" pkg="remote_mavros_control" type="mavros_joy_remote" respawn="true" output="screen">
+        <rosparam file="$(find remote_mavros_control)/config/control.yaml" command="load"/>
+    </node>
+
+</launch>

@@ -1,0 +1,24 @@
+velocity_multiplier:          1.5
+
+controller_mode:              "joy"
+
+joy_sub_topic:                "joy"
+cmd_vel_sub_topic:            "cmd_vel"
+
+mavros_local_pos_sub_topic:   "/mavros/local_position/pose"
+mavros_state_sub_topic:       "/mavros/state"
+mavros_position_sub_topic:    "/mavros/vision_pose/pose"
+
+mavros_waypoint_pub_topic:    "/mavros/setpoint_position/local"
+
+
+
+global_pos_sub_topic:         "/mavros/global_position/global"
+global_hdg_sub_topic:         "/mavros/global_position/compass_hdg"
+
+relative_alt_sub_topic:       "/mavros/global_position/rel_alt"
+
+global_waypoint_pub_topic:    "/mavros/setpoint_position/global"
+
+latitude_multiplier:          0.00001
+longitude_multiplier:         0.00002

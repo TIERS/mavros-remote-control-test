@@ -1,0 +1,357 @@
+#!/usr/bin/env python
+
+from re import S
+import sys
+import math
+import time
+import rospy
+import numpy as np
+
+from std_msgs.msg           import Float64
+
+from sensor_msgs.msg        import Joy
+from sensor_msgs.msg        import NavSatFix
+
+from geometry_msgs.msg      import Twist
+from geometry_msgs.msg      import PoseStamped, Quaternion
+
+from geographic_msgs.msg    import GeoPoseStamped
+
+from tf.transformations     import euler_from_quaternion, quaternion_from_euler
+
+from pygeodesy.geoids import GeoidPGM
+
+_egm96 = GeoidPGM('/usr/share/GeographicLib/geoids/egm96-5.pgm', kind=-3)
+
+class CMD_Vel_MAVROS_Controller :
+
+    def __init__(self) :
+        '''
+            Init node, subscribe to position data
+        ''' 
+        # Init node
+        rospy.init_node("CMD_Vel_MAVROS_Controller", anonymous=False)
+
+        # Class attributes
+        self.missing_counter = 0
+        self.yaw = 0
+        self.pos = PoseStamped()
+        self.speed_multiplier =  rospy.get_param("~velocity_multiplier", 1.5)
+        self.latitude_multiplier =  rospy.get_param("~latitude_multiplier", 0.00001)
+        self.longitude_multiplier =  rospy.get_param("~longitude_multiplier", 0.00002)
+        rospy.loginfo("Speed multiplier from joy to mavros local pos is {}".format(self.speed_multiplier))
+        rospy.loginfo("Latitude multiplier (meters to degrees) is    {}".format(self.speed_multiplier))
+        rospy.loginfo("Longitude multiplier (meters to degrees) is   {}".format(self.speed_multiplier))
+
+        # Get pos from PX4 EKF2 that already integrates positioning sources
+        self.local_pos_topic = rospy.get_param("~mavros_local_pos_sub_topic", "/mavros/local_position/pose")
+        rospy.loginfo("Subscribing to local (mavros) position at {}".format(self.local_pos_topic))
+
+        self.local_pos_sub = rospy.Subscriber(self.local_pos_topic, PoseStamped, self.local_pos_cb)
+
+        # Wait to get local pos lock
+        sys.stdout.write("Waiting for (mavros) local pos lock...")
+        while not self.pos.header.stamp :
+            sys.stdout.write("..")
+            sys.stdout.flush()
+            time.sleep(0.1)
+        self.home_pos = self.pos
+        self.command_pos = self.pos
+        rospy.loginfo("Home position locked: \n{}".format(self.pos.pose))
+
+        # Subscribe to cmd_vel
+        self.cmd_vel_topic =  rospy.get_param("~cmd_vel_sub_topic", "/cmd_vel")
+        rospy.loginfo("Subscribing to twist commands at {}".format(self.cmd_vel_topic))
+
+        self.cmd_vel_sub = rospy.Subscriber(self.cmd_vel_topic, Twist, self.cmd_vel_cb)
+
+        # Subscribe to Joy node
+        self.joy = Joy()
+        self.last_joy_seq = 0
+        self.joy_topic =  rospy.get_param("~joy_sub_topic", "/joy")
+        rospy.loginfo("Subscribing to Joy commands at {}".format(self.joy_topic))
+        self.joy_sub = rospy.Subscriber(self.joy_topic, Joy, self.joy_cb)
+
+        # Subscribe to global position
+        self.global_pos = NavSatFix()
+        self.compass_heading = Float64()
+        self.global_pos_topic = rospy.get_param("~global_pos_sub_topic", "/mavros/global_position/global")
+        self.global_hdg_topic = rospy.get_param("~global_hdg_sub_topic", "/mavros/global_position/compass_hdg")
+        self.global_pos_sub = rospy.Subscriber(self.global_pos_topic, NavSatFix, self.global_pos_cb)
+        self.global_hdg_sub = rospy.Subscriber(self.global_hdg_topic, Float64, self.global_hdg_cb)
+
+        # Other useful data
+        self.relative_altitude = Float64()
+        self.relative_alt_topic = rospy.get_param("~relative_alt_sub_topic", "/mavros/global_position/rel_alt")
+        self.relative_altitude_sub = rospy.Subscriber(self.relative_alt_topic, Float64, self.relative_altitude_cb)
+        
+        # Publish data
+        self.local_waypoint_topic = rospy.get_param("~mavros_waypoint_pub_topic", "/mavros/setpoint_position/local")
+        self.global_waypoint_topic = rospy.get_param("~global_waypoint_pub_topic", "/mavros/setpoint_position/global")
+        self.local_waypoint_pub = rospy.Publisher(self.local_waypoint_topic, PoseStamped, queue_size=10)
+        self.global_waypoint_pub = rospy.Publisher(self.global_waypoint_topic, GeoPoseStamped, queue_size=10)
+        
+    def geoid_height(self, lat, lon):
+        """
+        Calculates AMSL to ellipsoid conversion offset.
+        Uses EGM96 data with 5' grid and cubic interpolation.
+        The value returned can help you convert from meters 
+        above mean sea level (AMSL) to meters above
+        the WGS84 ellipsoid.
+        If you want to go from AMSL to ellipsoid height, add the value.
+        To go from ellipsoid height to AMSL, subtract this value.
+        """
+        return _egm96.height(lat, lon)
+
+    def local_pos_cb(self, pos) :
+        '''
+            Update position from mavros local pose (callback)
+        '''
+        self.pos = pos
+
+    def get_yaw(self):
+        '''
+            Get yaw from local mavros position
+        '''
+        quat = Quaternion()
+        quat = self.pos.pose.orientation 
+        quat_np = np.array([quat.x, quat.y, quat.z, quat.w])
+        _, _, yaw = euler_from_quaternion(quat_np)
+        return yaw
+
+    def global_pos_cb(self, pos) :
+        self.global_pos = pos
+
+    def global_hdg_cb(self, hdg) :
+        self.compass_heading = hdg
+
+    def relative_altitude_cb(self, alt) :
+        self.relative_altitude = alt
+    
+    def cmd_vel_cb(self, vel) :
+        '''
+            Update last cmd_vel command received
+            (to be replaced with data from JOY node)
+        '''
+        self.cmd_vel = vel
+
+    def joy_cb(self, joy_msg) :
+        '''
+            Update last joy message received
+        '''
+        self.joy = joy_msg
+
+    def global_command(self, tmr) :
+
+        #
+        #   Get yaw (local) and compass heading (global, in degrees, from 0 to 360)
+        #
+        self.yaw = self.get_yaw()
+        self.heading = - (self.compass_heading.data) * math.pi / 180
+
+        rospy.loginfo("Global posiiton is [{:.10f}, {:.10f}]. Altitude is {:.10f}, compass heading is {:.1f} ... ".format(
+                self.global_pos.latitude,
+                self.global_pos.longitude,
+                self.global_pos.altitude,
+                self.heading
+            ))
+        
+        new_yaw = 0
+        new_geopose = GeoPoseStamped()
+
+        if self.joy.header.seq > self.last_joy_seq or self.missing_counter < 50 :
+            
+            if self.joy.header.seq > self.last_joy_seq :
+                self.missing_counter = 0
+            else :
+                self.missing_counter += 1
+
+            self.last_joy_seq = self.joy.header.seq
+
+            # Update from current position
+            new_geopose.pose.position.longitude = self.global_pos.longitude
+            new_geopose.pose.position.latitude = self.global_pos.latitude
+            new_geopose.pose.position.altitude = self.global_pos.altitude - self.geoid_height(self.global_pos.latitude, self.global_pos.longitude) #self.relative_altitude.data #self.global_pos.altitude
+            new_geopose.pose.orientation = self.pos.pose.orientation
+            
+            self.command_pose = new_geopose.pose
+
+            up_down = self.joy.axes[1]
+            left_right = self.joy.axes[2]
+            forward_backwards = self.joy.axes[3]
+            yaw_rotate = self.joy.axes[0]
+
+            rospy.loginfo(" ... joy [{:.1f}, {:.1f}, {:.1f}, {:.1f}] received ...".format(
+                    up_down, 
+                    forward_backwards, 
+                    left_right,
+                    yaw_rotate
+                ))
+            
+            # Check that we have some altitude
+            if up_down > 0 :
+                new_geopose.pose.position.altitude += self.speed_multiplier * up_down
+            else :
+                up_down_normalized = min(self.relative_altitude, - self.speed_multiplier * up_down)
+                new_geopose.pose.position.altitude -= up_down_normalized
+
+            # Next calculate how much to move in latitude and longitude forwards
+            # based on the compass heading
+            latitude_move = self.latitude_multiplier * self.speed_multiplier * forward_backwards * math.cos(self.heading)
+            longitude_move = self.longitude_multiplier * self.speed_multiplier * forward_backwards * math.sin(self.heading)
+
+            # Now based on left-right ...
+            latitude_move -= self.latitude_multiplier * self.speed_multiplier * left_right * math.cos(self.heading - math.pi / 2)
+            longitude_move -= self.longitude_multiplier * self.speed_multiplier * left_right * math.sin(self.heading - math.pi / 2)
+
+            new_geopose.pose.position.longitude -= longitude_move
+            new_geopose.pose.position.latitude += latitude_move
+
+            # Now assume we can just modify the local yaw
+            new_yaw = self.yaw + 0.1 * self.speed_multiplier * yaw_rotate
+            new_quat = quaternion_from_euler(0, 0, new_yaw)
+            new_geopose.pose.orientation.x = new_quat[0]
+            new_geopose.pose.orientation.y = new_quat[1]
+            new_geopose.pose.orientation.z = new_quat[2]
+            new_geopose.pose.orientation.w = new_quat[3]
+
+        
+        else :
+            
+            rospy.loginfo(" ... STAYING --- NO JOY MESSAGE ...")
+            try :
+                new_geopose.pose = self.command_pose
+            except :
+                rospy.logwarn("CANNOT set past position and there is NO NEW JOY MESSAGE")
+
+        new_geopose.header.stamp = rospy.Time.now()
+
+        rospy.loginfo(" ... going to [{:.10f}, {:.10f}, {:.1f}] and yaw {:.1f}\n\n".format(
+                new_geopose.pose.position.latitude,
+                new_geopose.pose.position.longitude,
+                new_geopose.pose.position.altitude,
+                new_yaw
+            ))
+
+        self.global_waypoint_pub.publish(new_geopose)
+
+    def update_command(self, tmr) :
+        self.yaw = self.get_yaw()
+        rospy.loginfo("Local posiiton is [{:.1f}, {:.1f}, {:.1f}] ... ".format(
+                self.pos.pose.position.x,
+                self.pos.pose.position.y,
+                self.pos.pose.position.z,
+                self.yaw
+            ))
+        
+        new_yaw = 0
+        new_pose = PoseStamped()
+        if self.joy.header.seq > self.last_joy_seq :
+
+            new_pose = self.pos
+            self.last_joy_seq = self.joy.header.seq
+            self.command_pos = self.pos
+            up_down = self.joy.axes [1]
+            left_right = self.joy.axes[2]
+            forward_backwards = self.joy.axes[3]
+            yaw_rotate = self.joy.axes[0]
+
+            rospy.loginfo(" ... joy [{:.1f}, {:.1f}, {:.1f}] received ...".format(
+                    up_down, 
+                    forward_backwards, 
+                    left_right,
+                    yaw_rotate
+                ))
+
+            new_pose.pose.position.x = new_pose.pose.position.x + self.speed_multiplier * forward_backwards
+            new_pose.pose.position.y = new_pose.pose.position.y - self.speed_multiplier * left_right           # TODO Double check
+            new_pose.pose.position.z = new_pose.pose.position.z + self.speed_multiplier * up_down
+            new_yaw = self.yaw + 0.2* self.speed_multiplier * yaw_rotate
+            new_quat = quaternion_from_euler(0, 0, new_yaw)
+            new_pose.pose.orientation.x = new_quat[0]
+            new_pose.pose.orientation.y = new_quat[1]
+            new_pose.pose.orientation.z = new_quat[2]
+            new_pose.pose.orientation.w = new_quat[3]
+
+            if new_pose.pose.position.z < 0 :
+                new_pose.pose.position.z = 0
+        
+        else :
+            rospy.loginfo(" ... STAY ...")
+            new_pose.pose = self.command_pos.pose
+
+        new_pose.header.stamp = rospy.Time.now()
+
+        rospy.loginfo(" ... going to [{:.1f}, {:.1f}, {:.1f}]\n\n".format(
+                new_pose.pose.position.x,
+                new_pose.pose.position.y,
+                new_pose.pose.position.z,
+                new_yaw
+            ))
+
+        self.local_waypoint_pub.publish(new_pose)
+
+    def check_all_is_ok(self, tmr) :
+        '''
+            Check we are not missing any critical data !!!
+
+            Should also update some state variable so that if data comes with a delay, 
+            we don't move the drone (for example), or if it doesn't come at all, then
+            we go back home (for example).
+        '''
+        pass
+
+    def run(self) :
+        '''
+            Infinite loop with 20 Hz sleep
+
+            Before the loop starts, initialize three timers:
+
+            Timer 1 for checking the timestampts of critical data
+            Timer 2 for setting objective waypoint in local reference
+            Timer 3 for setting objective waypoint in GLOBAL reference
+        ''' 
+        # Set Rospy rate
+        rate = rospy.Rate(20.0)
+
+        # Set objective update timer
+        time.sleep(1)
+        self.checker_timer = rospy.Timer(rospy.Duration(0.1), self.check_all_is_ok)
+        # self.objective_timer = rospy.Timer(rospy.Duration(0.05), self.update_command)
+        self.global_offboard_timer = rospy.Timer(rospy.Duration(0.02), self.global_command)
+
+        # Infinite loop
+        try:
+            while not rospy.is_shutdown() :
+                rate.sleep()
+
+        except KeyboardInterrupt :
+            self.checker_timer.shutdown()
+            # self.objective_timer.shutdown()
+            self.global_offboard_timer.shutdown()
+            rospy.logerr('Keyboard Interrupt detected! Shutting down timers :)')
+
+
+if __name__ == '__main__':
+    '''
+        Run the node
+    '''
+    try:
+        
+        rospy.loginfo("Starting MAVROS Remote controller node")
+
+        # Create new object
+        controller = CMD_Vel_MAVROS_Controller()
+
+        # Loop while reading data
+        controller.run()
+
+    except rospy.ROSInterruptException:
+        
+        rospy.logwarn("Exception. Closing MAVROS Remote controller node")
+
+    controller.checker_timer.shutdown()
+    # controller.objective_timer.shutdown()
+    controller.global_offboard_timer.shutdown()
+    rospy.logerr('Keyboard Interrupt detected! Shutting down timers :)')
+    rospy.loginfo("Closed MAVROS Remote controller node")
